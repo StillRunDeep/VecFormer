@@ -14,6 +14,10 @@
 6. [训练流程](#6-训练流程)
 7. [代码阅读路线图](#7-代码阅读路线图)
 8. [常见概念速查](#8-常见概念速查)
+9. [推理流程详解](#9-推理流程详解)
+10. [项目中的设计模式](#10-项目中的设计模式)
+11. [完整前向传播追踪](#11-完整前向传播追踪)
+12. [常见问题与解决](#12-常见问题与解决)
 
 ---
 
@@ -559,6 +563,306 @@ bash scripts/test.sh
 | `torchrun` | PyTorch 多 GPU 分布式训练启动工具 | `scripts/train.sh` |
 | `AdamW` | 带权重衰减的 Adam 优化器，深度学习标配 | `configs/vecformer.yaml` |
 | `warmup` | 训练初期用小学习率逐渐升到目标值，防止早期不稳定 | `configs/vecformer.yaml` |
+
+---
+
+## 9. 推理流程详解
+
+训练完成后，模型如何把输出变成最终的"哪条线属于哪个实例/类别"？
+
+### 9.1 原始输出
+
+CAD 解码器的最后一块（block 6）产生：
+
+```
+pred_sem_labels  : (N, 35)     每条线段属于各类别的分数（logits）
+pred_inst_masks  : (Q, N)      Q 个查询向量对 N 条线段的掩码分数
+pred_inst_labels : (Q, 35)     Q 个查询向量各类别的分数
+pred_inst_scores : (Q, 1)      Q 个查询向量的置信度
+
+其中：N = 该图总线段数，Q = 查询向量数（训练时动态确定，推理时 = N）
+```
+
+### 9.2 语义预测（predict_semantic）
+
+```python
+# 代码位置：modeling_vecformer.py → predict_semantic()
+
+# 1. Softmax：把 logits 变成概率
+probs = softmax(pred_sem_labels, dim=-1)   # (N, 35)
+
+# 2. 取最大值：每条线段的预测类别和置信度
+pred_class = argmax(probs, dim=-1)   # (N,)  → 类别 ID
+pred_score = max(probs, dim=-1)      # (N,)  → 最大概率
+```
+
+### 9.3 实例预测（predict_instance）
+
+```python
+# 代码位置：modeling_vecformer.py → predict_instance()
+
+# 1. 过滤低置信度查询（pred_score_thr = 0.5）
+keep = pred_inst_scores > 0.5
+
+# 2. 激活掩码（sigmoid 变成 0~1 的概率）
+masks = sigmoid(pred_inst_masks[keep])   # (K, N)
+
+# 3. 过滤太小的实例（太少的线段）
+valid_masks = masks > mask_logit_thr   # (K, N) → 布尔掩码
+
+# 4. 对象归一化（可选）：用实例内部的线段长度加权分数
+#    避免把一条很长线的"局部匹配"误判为完整实例
+
+# 5. 取 Top-K（num_topk_preds = 600）
+#    按分数排序，只保留最好的 600 个预测
+```
+
+### 9.4 全景融合（predict_panoptic）
+
+语义预测和实例预测可能冲突（同一条线既被预测为"门实例#1"也被预测为"门"语义），需要融合：
+
+```
+对每条线段，投票决定其归属：
+1. 如果它在某个置信度足够高的实例掩码中 → 归属该实例
+2. 如果它属于 Stuff 类别（背景类：30-34）→ 只做语义不做实例
+3. 冲突时，得分高的实例优先
+
+最终每条线得到：(语义类别, 实例ID) 二元组
+```
+
+### 9.5 Vector NMS（向量非极大值抑制）
+
+```python
+# 代码位置：model/vecformer/modules/__init__.py → vector_nms()
+
+# 功能：去除重复的实例预测
+# 原理：两个预测掩码的 IoU > 阈值时，保留置信度高的，去除低的
+# 专为向量图形设计，使用线段级别的 IoU 计算
+```
+
+---
+
+## 10. 项目中的设计模式
+
+理解这些设计模式有助于快速读懂整个代码库。
+
+### 10.1 注册表模式（Registry Pattern）
+
+项目用注册表把"模型名称字符串"映射到"实际的模型类"，实现了配置与代码的解耦：
+
+```python
+# 代码位置：model/__init__.py
+
+# 注册
+@register_model("vecformer")
+def build(model_args: dict):
+    return VecFormer(VecFormerConfig(**model_args)), VecFormerTrainer
+
+# 使用（在 launch.py 中）
+model, trainer_class = build_model("vecformer", model_args)
+# ↑ 只需要传字符串名称，不需要 import 具体类
+```
+
+好处：要添加新模型，只需新建文件 + 一个 `@register_model("my_model")`，launch.py 无需任何修改。
+
+数据集同理，使用 `@register_dataset("floorplancad")`（`data/__init__.py`）。
+
+### 10.2 HuggingFace Trainer 模式
+
+项目基于 HuggingFace `transformers` 库的 `Trainer` 类，这个类封装了训练循环、评估、存档等大量样板代码：
+
+```python
+# 代码位置：model/vecformer/vecformer_trainer.py
+
+class VecFormerTrainer(Trainer):
+    # 只需要重写需要定制的部分
+
+    def compute_loss(self, model, inputs, ...):
+        # 自定义损失计算
+
+    def prediction_step(self, model, inputs, ...):
+        # 自定义推理步骤（返回预测结果供评估）
+```
+
+这意味着：分布式训练、混合精度、梯度累积、进度条等功能都由 HuggingFace 自动处理。
+
+### 10.3 PretrainedConfig 模式
+
+`VecFormerConfig` 继承自 HuggingFace 的 `PretrainedConfig`，好处：
+
+```python
+# 保存配置
+config.save_pretrained("outputs/my_model/")
+# → 自动生成 outputs/my_model/config.json
+
+# 加载配置
+config = VecFormerConfig.from_pretrained("outputs/my_model/")
+# → 从 JSON 恢复完整配置
+```
+
+### 10.4 PointModule 模式
+
+`PointTransformerV3` 中使用 `PointModule` / `PointSequential` 代替标准的 `nn.Module` / `nn.Sequential`，因为点云数据不能简单地用张量传递（每个点有坐标、特征、批次信息等），需要用字典 `point` 打包：
+
+```python
+# 标准 PyTorch 写法
+x = layer1(x)
+x = layer2(x)
+
+# PointModule 写法
+point = layer1(point)   # point 是一个包含 feat/coord/offset 等的字典
+point = layer2(point)
+```
+
+---
+
+## 11. 完整前向传播追踪
+
+用具体数字追踪一次推理，建立对张量维度变化的直观认识。
+
+**假设**：一批 2 张图，分别有 300 和 500 条线段，总计 800 条。
+
+```
+输入
+  coords      : (800, 4)   每条线的 [x1, y1, x2, y2]
+  feats       : (800, 7)   每条线的特征
+  cu_seqlens  : [0, 300, 800]   批次边界
+
+── PointTransformerV3 骨干网络 ──────────────────────────────
+
+  步骤1：体素化 & 稀疏卷积
+    feats: (800, 7) → 投影 → (800, 32)   [enc_channels[0] = 32]
+
+  步骤2：序列化（Hilbert 曲线排序）
+    对 800 条线段重新排序，空间相邻的聚在一起
+
+  步骤3：编码器层1（深度=2, 通道=32）
+    每次做局部注意力（patch_size=1024，这里 800<1024，所以全局）
+    输出：(800, 32)
+
+  步骤4：编码器层2（下采样 stride=2, 通道=64）
+    下采样：800 → 400 条关键线段
+    输出：(400, 64)
+
+  步骤5：编码器层3 → (200, 128)
+  步骤6：编码器层4 → (100, 256)（深度=6）
+  步骤7：编码器层5 → (50, 512)
+
+  步骤8：解码器（逐步上采样恢复分辨率）
+    (50, 512) + skip(100, 256) → (100, 256)
+    (100, 256) + skip(200, 128) → (200, 128)
+    (200, 128) + skip(400, 64)  → (400, 64)
+    (400, 64)  + skip(800, 32)  → (800, 64)   [dec_channels[0]=64]
+
+  骨干输出：(800, 64)   每条线段有 64 维语义特征
+
+── Layer Fusion（图层融合）──────────────────────────────────
+
+  layer_ids 标记每条线属于哪个 CAD 图层
+  GroupFeatFusion：同一图层的线段特征聚合求均值，再拼接回来
+  输出：(800, 64)   形状不变，但融入了图层级上下文
+
+── CAD Decoder ──────────────────────────────────────────────
+
+  查询向量初始化（推理时 Q = N = 800）
+    queries: (800, 64) ← 来自骨干特征的采样
+
+  解码器 Block × 6：
+    自注意力：queries (800, 64) 内部交流  → (800, 64)
+    交叉注意力：queries 查询 backbone feats → (800, 64)
+    FFN       : (800, 64) → (800, 64)
+    预测头    : → 本轮预测结果
+
+  最终输出（来自第6块）：
+    pred_sem_labels  : (800, 35)    语义类别分数
+    pred_inst_masks  : (800, 800)   实例掩码矩阵
+    pred_inst_labels : (800, 35)    实例类别分数
+    pred_inst_scores : (800, 1)     实例置信度
+
+── 后处理 ───────────────────────────────────────────────────
+
+  过滤 + NMS + 投票后，最终输出：
+    每条线段 → (语义类别 ID, 实例 ID)
+```
+
+---
+
+## 12. 常见问题与解决
+
+### Q1：CUDA out of memory（显存不足）
+
+```bash
+# 原因：batch size 太大，或图纸线段数太多
+# 解决：减小 batch size
+per_device_train_batch_size: 1   # configs/vecformer.yaml
+
+# 或者减小 patch_size（减少单次注意力计算量）
+enc_patch_size: (512, 512, 512, 512, 512)   # 默认是 1024
+```
+
+### Q2：flash_attn 安装失败 / RuntimeError
+
+```bash
+# 在 RTX 2080 Ti（sm_75）上，指定架构编译：
+CUDA_ARCH=75 MAX_JOBS=8 python setup.py install
+
+# 如果仍有问题，直接禁用 Flash Attention：
+# 在 configuration_vecformer.py 中：
+backbone_config = dict(
+    ...
+    enable_flash=False,       # 关闭
+    upcast_attention=True,    # 开启以保证数值稳定
+    upcast_softmax=True,
+)
+```
+
+### Q3：ImportError: No module named 'flash_attn'
+
+```
+这是正常的。模型会自动 fallback 到标准注意力，同时打印 UserWarning。
+功能完全正常，只是速度略慢。
+```
+
+### Q4：训练 PQ 指标不上升
+
+```
+可能原因：
+1. 学习率太大/太小：尝试 lr = 1e-4（默认）到 5e-5 之间
+2. batch size 太小：确保总 batch size ≥ 8（4块GPU × 2）
+3. 数据预处理问题：检查 FloorPlanCAD-sampled-as-line-jsons 是否正确生成
+4. 评估频率太低：减小 eval_steps（默认 2175）更早发现问题
+```
+
+### Q5：如何查看训练曲线
+
+```bash
+# 启动 TensorBoard
+tensorboard --logdir outputs/
+
+# 浏览器打开 http://localhost:6006
+# 关注：train/loss, eval/PQ, eval/SQ, eval/RQ
+```
+
+### Q6：如何只用 1 块 GPU 训练（用于调试）
+
+```bash
+# 修改 scripts/train.sh，或直接运行：
+NPROC_PER_NODE=1 bash scripts/train.sh
+
+# 注意：1 GPU 时 batch size 实际只有 2，需要增大 epoch 或减小 eval_steps
+```
+
+### Q7：如何可视化预测结果
+
+```bash
+# 数据预处理时加 --save_type=svg 可以生成 SVG 文件
+python data/floorplancad/preprocess.py \
+    --input_dir=datasets/FloorPlanCAD \
+    --output_dir=datasets/debug_vis \
+    --dynamic_sampling \
+    --connect_lines \
+    --save_type=svg
+```
 
 ---
 
