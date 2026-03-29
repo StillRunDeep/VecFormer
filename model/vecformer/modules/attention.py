@@ -1,6 +1,60 @@
 import torch
 import torch.nn as nn
-import flash_attn
+import torch.nn.functional as F
+
+try:
+    import flash_attn
+except ImportError:
+    flash_attn = None
+
+
+def _varlen_sdpa_qkvpacked(qkv_packed, cu_seqlens, dropout_p):
+    """
+    Fallback for flash_attn_varlen_qkvpacked_func using PyTorch SDPA.
+
+    Args:
+        qkv_packed: (total_seq_len, 3, H, D)
+        cu_seqlens: (B+1,) cumulative sequence lengths
+        dropout_p: dropout probability
+
+    Returns:
+        (total_seq_len, H, D)
+    """
+    outputs = []
+    for i in range(len(cu_seqlens) - 1):
+        s, e = int(cu_seqlens[i]), int(cu_seqlens[i + 1])
+        q = qkv_packed[s:e, 0].transpose(0, 1).unsqueeze(0)  # (1, H, L, D)
+        k = qkv_packed[s:e, 1].transpose(0, 1).unsqueeze(0)
+        v = qkv_packed[s:e, 2].transpose(0, 1).unsqueeze(0)
+        out = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
+        outputs.append(out.squeeze(0).transpose(0, 1))  # (L, H, D)
+    return torch.cat(outputs, dim=0)
+
+
+def _varlen_sdpa_cross(q, kv, cu_seqlens_q, cu_seqlens_kv, dropout_p):
+    """
+    Fallback for flash_attn_varlen_func using PyTorch SDPA.
+
+    Args:
+        q:   (total_seqlen_q, H, D)
+        kv:  (total_seqlen_kv, 2, H, D)
+        cu_seqlens_q:  (B+1,)
+        cu_seqlens_kv: (B+1,)
+        dropout_p: dropout probability
+
+    Returns:
+        (total_seqlen_q, H, D)
+    """
+    outputs = []
+    for i in range(len(cu_seqlens_q) - 1):
+        sq, eq = int(cu_seqlens_q[i]), int(cu_seqlens_q[i + 1])
+        sk, ek = int(cu_seqlens_kv[i]), int(cu_seqlens_kv[i + 1])
+        qi = q[sq:eq].transpose(0, 1).unsqueeze(0)       # (1, H, Lq, D)
+        ki = kv[sk:ek, 0].transpose(0, 1).unsqueeze(0)   # (1, H, Lkv, D)
+        vi = kv[sk:ek, 1].transpose(0, 1).unsqueeze(0)
+        out = F.scaled_dot_product_attention(qi, ki, vi, dropout_p=dropout_p)
+        outputs.append(out.squeeze(0).transpose(0, 1))   # (Lq, H, D)
+    return torch.cat(outputs, dim=0)
 
 
 class VarlenSelfAttention(nn.Module):
@@ -36,15 +90,19 @@ class VarlenSelfAttention(nn.Module):
             total_seq_len, 3, H, D)  # (total_seq_len, 3, H, D)
         max_seqlen = torch.max(cu_seqlens[1:] - cu_seqlens[:-1]).item()
 
-        attn_output = flash_attn.flash_attn_varlen_qkvpacked_func(
-            qkv_packed.half(),
-            cu_seqlens,
-            max_seqlen,
-            dropout_p=self.attn_drop if self.training else 0.0,
-        )  # (total_seq_len, H, D) # type: ignore
-        attn_output = attn_output.to(inputs.dtype)  # type: ignore
-        attn_output = attn_output.reshape(total_seq_len,
-                                          E)  # (total_seq_len, E)
+        dropout_p = self.attn_drop if self.training else 0.0
+        if flash_attn is not None:
+            attn_output = flash_attn.flash_attn_varlen_qkvpacked_func(
+                qkv_packed.to(torch.float16),
+                cu_seqlens,
+                max_seqlen,
+                dropout_p=dropout_p,
+            )  # (total_seq_len, H, D)
+        else:
+            attn_output = _varlen_sdpa_qkvpacked(qkv_packed, cu_seqlens, dropout_p)
+
+        attn_output = attn_output.to(inputs.dtype)
+        attn_output = attn_output.reshape(total_seq_len, E)  # (total_seq_len, E)
 
         output = self.dropout(self.out_proj(attn_output))
 
@@ -127,15 +185,19 @@ class VarlenSelfAttentionWithRoPE(VarlenSelfAttention):
             qkv_packed[:, 0], qkv_packed[:, 1], freqs_cis)
         # ------------------------------------------------ #
 
-        attn_output = flash_attn.flash_attn_varlen_qkvpacked_func(
-            qkv_packed.half(),
-            cu_seqlens,
-            max_seqlen,
-            dropout_p=self.attn_drop if self.training else 0.0,
-        )  # (total_seq_len, H, D) # type: ignore
-        attn_output = attn_output.to(inputs.dtype)  # type: ignore
-        attn_output = attn_output.reshape(total_seq_len,
-                                          E)  # (total_seq_len, E)
+        dropout_p = self.attn_drop if self.training else 0.0
+        if flash_attn is not None:
+            attn_output = flash_attn.flash_attn_varlen_qkvpacked_func(
+                qkv_packed.to(torch.float16),
+                cu_seqlens,
+                max_seqlen,
+                dropout_p=dropout_p,
+            )  # (total_seq_len, H, D)
+        else:
+            attn_output = _varlen_sdpa_qkvpacked(qkv_packed, cu_seqlens, dropout_p)
+
+        attn_output = attn_output.to(inputs.dtype)
+        attn_output = attn_output.reshape(total_seq_len, E)  # (total_seq_len, E)
 
         output = self.dropout(self.out_proj(attn_output))
 
@@ -185,17 +247,23 @@ class VarlenCrossAttention(nn.Module):
         max_seqlen_queries = torch.max(cu_seqlens_queries[1:] -
                                        cu_seqlens_queries[:-1]).item()
 
-        attn_output = flash_attn.flash_attn_varlen_func(
-            q.half(),
-            kv[:, 0].half(),
-            kv[:, 1].half(),
-            cu_seqlens_queries,
-            cu_seqlens_inputs,
-            max_seqlen_queries,
-            max_seqlen_inputs,
-            dropout_p=self.attn_drop if self.training else 0.0,
-        )  # (total_seqlen_queries, H, D) # type: ignore
-        attn_output = attn_output.to(queries.dtype)  # type: ignore
+        dropout_p = self.attn_drop if self.training else 0.0
+        if flash_attn is not None:
+            attn_output = flash_attn.flash_attn_varlen_func(
+                q.to(torch.float16),
+                kv[:, 0].to(torch.float16),
+                kv[:, 1].to(torch.float16),
+                cu_seqlens_queries,
+                cu_seqlens_inputs,
+                max_seqlen_queries,
+                max_seqlen_inputs,
+                dropout_p=dropout_p,
+            )  # (total_seqlen_queries, H, D)
+        else:
+            attn_output = _varlen_sdpa_cross(
+                q, kv, cu_seqlens_queries, cu_seqlens_inputs, dropout_p)
+
+        attn_output = attn_output.to(queries.dtype)
         attn_output = attn_output.reshape(total_seqlen_queries,
                                           E)  # (total_seqlen_queries, E)
 
