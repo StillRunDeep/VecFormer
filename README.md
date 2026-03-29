@@ -26,13 +26,17 @@ conda activate vecformer
 pip install torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 --index-url https://download.pytorch.org/whl/cu118
 
 # Install torch-scatter
-pip install torch-scatter -f https://data.pyg.org/whl/torch-2.5.0+cu118.html
+pip install torch-scatter -f https://data.pyg.org/whl/torch-2.5.1+cu118.html
 
 # Install flash-attention (we recommend building from source)
 pip install packaging ninja
 git clone https://github.com/Dao-AILab/flash-attention.git
 cd flash-attention
-MAX_JOBS=64 python setup.py install # Change `MAX_JOBS` to fit your machine
+# Set CUDA_ARCH to match your GPU: 75=RTX 2080Ti, 80=A100, 86=RTX 3090, 89=RTX 4090
+# For RTX 2080 Ti (Turing, sm_75):
+CUDA_ARCH=75 MAX_JOBS=8 python setup.py install
+# For Ampere+ GPUs (RTX 3090/A100/RTX 4090), you may omit CUDA_ARCH or set it accordingly
+# Note: flash-attention is optional. If not installed, the model falls back to standard attention.
 cd ..
 
 # Install other requirements

@@ -351,6 +351,21 @@ class SerializedAttention(PointModule):
         self.upcast_attention = upcast_attention
         self.upcast_softmax = upcast_softmax
         self.enable_rpe = enable_rpe
+        if enable_flash and flash_attn is None:
+            import warnings
+            warnings.warn(
+                "flash_attn is not installed or failed to import. "
+                "Falling back to standard attention (enable_flash=False). "
+                "For better performance on Ampere+ GPUs (sm_80+), "
+                "install flash-attention with: "
+                "CUDA_ARCH=75 MAX_JOBS=8 python setup.py install",
+                UserWarning,
+                stacklevel=2,
+            )
+            enable_flash = False
+            upcast_attention = True
+            upcast_softmax = True
+
         self.enable_flash = enable_flash
         if enable_flash:
             assert (
@@ -362,7 +377,6 @@ class SerializedAttention(PointModule):
             assert (
                 upcast_softmax is False
             ), "Set upcast_softmax to False when enable Flash Attention"
-            assert flash_attn is not None, "Make sure flash_attn is installed."
             self.patch_size = patch_size
             self.attn_drop = attn_drop
         else:
@@ -484,7 +498,7 @@ class SerializedAttention(PointModule):
             feat = (attn @ v).transpose(1, 2).reshape(-1, C)
         else:
             feat = flash_attn.flash_attn_varlen_qkvpacked_func(
-                qkv.half().reshape(-1, 3, H, C // H),
+                qkv.to(torch.float16).reshape(-1, 3, H, C // H),
                 cu_seqlens,
                 max_seqlen=self.patch_size,
                 dropout_p=self.attn_drop if self.training else 0,

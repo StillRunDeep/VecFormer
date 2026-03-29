@@ -1,7 +1,26 @@
 """
 VecFormer configuration
 """
+import warnings
+import torch
 from transformers import PretrainedConfig
+
+
+def _check_gpu_flash_support():
+    """Warn if the current GPU may not fully support Flash Attention."""
+    if not torch.cuda.is_available():
+        return
+    cc = torch.cuda.get_device_capability()
+    name = torch.cuda.get_device_name()
+    if cc < (8, 0):
+        warnings.warn(
+            f"GPU '{name}' has compute capability {cc[0]}.{cc[1]} "
+            f"(< 8.0 Ampere). Flash Attention may be unstable or unavailable. "
+            f"If you encounter errors, set enable_flash=False in backbone_config "
+            f"or ensure flash-attention is compiled with CUDA_ARCH={cc[0]}{cc[1]}.",
+            UserWarning,
+            stacklevel=3,
+        )
 
 
 class VecFormerConfig(PretrainedConfig):
@@ -111,6 +130,9 @@ class VecFormerConfig(PretrainedConfig):
         **kwargs
     ):
         super().__init__(**kwargs)
+
+        if backbone_config.get("enable_flash", True):
+            _check_gpu_flash_support()
 
         self.num_instance_classes: int = num_instance_classes
         self.num_semantic_classes: int = num_semantic_classes
